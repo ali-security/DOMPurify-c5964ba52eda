@@ -792,6 +792,30 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       }
     }
 
+    /*
+     * Mirror the clone-before-mutate pattern already applied above for
+     * cfg.ADD_TAGS / cfg.ADD_ATTR: if any uponSanitize* hook is
+     * registered AND the set still points at the default constant,
+     * clone it. The hook then mutates the clone (in-call widening
+     * still works exactly as documented) and the next default-cfg
+     * call rebinds to the untouched original via the reassignment at
+     * the top of this function.
+     */
+    if (
+      (hooks.uponSanitizeElement.length > 0 ||
+        hooks.uponSanitizeAttribute.length > 0) &&
+      ALLOWED_TAGS === DEFAULT_ALLOWED_TAGS
+    ) {
+      ALLOWED_TAGS = clone(ALLOWED_TAGS);
+    }
+
+    if (
+      hooks.uponSanitizeAttribute.length > 0 &&
+      ALLOWED_ATTR === DEFAULT_ALLOWED_ATTR
+    ) {
+      ALLOWED_ATTR = clone(ALLOWED_ATTR);
+    }
+
     // Prevent further manipulation of configuration.
     // Not available in IE8, Safari 5, etc.
     if (freeze) {
