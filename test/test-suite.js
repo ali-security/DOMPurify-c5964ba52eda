@@ -6284,6 +6284,117 @@
       }
     );
 
+    // A hook that detaches a node via node.remove() (the documented removal
+    // pattern) takes the subtree out of the tree before the walker reaches
+    // its descendants, and hook-detached nodes are deliberately not recorded
+    // in DOMPurify.removed. Without an inline neutralize at the hook-detach
+    // early returns, a descendant that was already loading keeps its queued
+    // on* handler and fires in page scope after sanitize returns, even though
+    // the returned tree is clean. Same shape as the REPORT-3 tests above:
+    // onerror with no src, assert the attribute is gone. Covers both element
+    // hooks.
+    [
+      { hook: 'uponSanitizeElement', label: 'uponSanitizeElement' },
+      { hook: 'beforeSanitizeElements', label: 'beforeSanitizeElements' },
+    ].forEach(({ hook, label }) => {
+      QUnit.test(
+        'IN_PLACE: ' +
+          label +
+          ' node.remove() neutralizes the detached subtree (audit-5 F1)',
+        (assert) => {
+          const root = document.createElement('div');
+          root.innerHTML =
+            '<section><img id="tail" onerror="alert(1)"></section>' +
+            '<div>safe</div>';
+          const tail = root.querySelector('#tail');
+
+          DOMPurify.addHook(hook, (node) => {
+            if (node.nodeName === 'SECTION') {
+              node.remove();
+            }
+          });
+
+          try {
+            const ret = DOMPurify.sanitize(root, { IN_PLACE: true });
+
+            assert.equal(ret, root, 'returns the same in-place node');
+            assert.notOk(
+              ret.querySelector('section, #tail'),
+              'detached subtree is absent from the returned tree'
+            );
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'on* handler stripped from the hook-detached descendant'
+            );
+
+            // App-side store-and-rerender must expose no executable sink.
+            const probe = document.createElement('div');
+            probe.innerHTML = ret.outerHTML + tail.outerHTML;
+            assert.notOk(
+              probe.querySelector('[onerror],[onload],script'),
+              'no executable sink survives serialize/reparse: ' +
+                probe.innerHTML
+            );
+          } finally {
+            DOMPurify.removeHook(hook);
+          }
+        }
+      );
+
+      // The same hook-detach inside an attached shadow root: the IN_PLACE
+      // pre-pass walks shadow trees with their own iterator, which skips the
+      // descendants of a detached node just like the main walk does.
+      QUnit.test(
+        'IN_PLACE: ' +
+          label +
+          ' node.remove() inside an attached shadow root neutralizes the detached subtree',
+        (assert) => {
+          const host = document.createElement('div');
+          const shadow = host.attachShadow({ mode: 'open' });
+          // No src on the img: avoid a load firing onerror in this test.
+          shadow.innerHTML =
+            '<section><p><img id="deep" onload="alert(1)" ' +
+            'onerror="alert(2)" title="kept"></p></section>' +
+            '<div>safe</div>';
+          const deep = shadow.querySelector('#deep');
+
+          DOMPurify.addHook(hook, (node) => {
+            if (node.nodeName === 'SECTION') {
+              node.remove();
+            }
+          });
+
+          try {
+            const ret = DOMPurify.sanitize(host, { IN_PLACE: true });
+
+            assert.equal(ret, host, 'returns the same in-place node');
+            assert.notOk(
+              host.shadowRoot.querySelector('section, #deep'),
+              'detached subtree is absent from the shadow root'
+            );
+            assert.strictEqual(
+              deep.getAttribute('onerror'),
+              null,
+              'onerror stripped from the hook-detached shadow descendant'
+            );
+            assert.strictEqual(
+              deep.getAttribute('onload'),
+              null,
+              'onload stripped from the hook-detached shadow descendant'
+            );
+            assert.strictEqual(
+              deep.getAttribute('title'),
+              'kept',
+              'allow-listed attributes are left alone'
+            );
+          } finally {
+            DOMPurify.removeHook(hook);
+          }
+        }
+      );
+    });
+
     // =======================================================================
     // Security regression — GHSA-vxr8-fq34-vvx9 (CVE-2026-65899):
     // a caller-supplied TRUSTED_TYPES_POLICY must not outlive its config,

@@ -168,6 +168,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   const getParentNode = lookupGetter(ElementPrototype, 'parentNode');
   const getShadowRoot = lookupGetter(ElementPrototype, 'shadowRoot');
   const getAttributes = lookupGetter(ElementPrototype, 'attributes');
+  const removeAttribute = lookupGetter(ElementPrototype, 'removeAttribute');
   const getNodeType =
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeType') : null;
   const getNodeName =
@@ -1458,19 +1459,104 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   };
 
   /**
+   * _stripDisallowedAttributes
+   *
+   * Removes every attribute whose name is not allow-listed from a single
+   * element. The attribute list is read, and each attribute removed, through
+   * the cached Element.prototype accessors, so a clobbering child on a <form>
+   * cannot redirect either step. No user hooks run here and nothing is
+   * recorded in DOMPurify.removed: this is only used on subtrees that have
+   * already left the tree being sanitized.
+   *
+   * @param element element to strip
+   */
+  const _stripDisallowedAttributes = function (element: Element): void {
+    const attributes = getAttributes(element);
+    if (!attributes) {
+      return;
+    }
+
+    for (let i = attributes.length - 1; i >= 0; --i) {
+      const attribute = attributes[i];
+      const name = attribute && attribute.name;
+      if (typeof name !== 'string' || ALLOWED_ATTR[transformCaseFunc(name)]) {
+        continue;
+      }
+
+      try {
+        removeAttribute(element, name);
+      } catch (_) {
+        /* Ignore - the node is already out of the tree being sanitized */
+      }
+    }
+  };
+
+  /**
+   * _neutralizeSubtree
+   *
+   * Strips the non-allow-listed attributes (every on* handler among them)
+   * from a node and all of its descendants. Used on the IN_PLACE path for a
+   * subtree that a hook detached mid-walk: the node iterator never visits the
+   * descendants of a detached node, yet a descendant that began loading while
+   * the caller built the live tree (e.g. an <img onerror>) can still fire its
+   * queued handler in page scope after sanitize() returns. Walks through the
+   * cached childNodes getter and never throws.
+   *
+   * @param root the detached node whose subtree is neutralized
+   */
+  const _neutralizeSubtree = function (root: Node): void {
+    const stack: Node[] = [root];
+
+    while (stack.length > 0) {
+      const node = arrayPop(stack);
+
+      try {
+        const nodeType = getNodeType
+          ? getNodeType(node)
+          : (node as Node).nodeType;
+        if (nodeType === NODE_TYPE.element) {
+          _stripDisallowedAttributes(node as Element);
+        }
+
+        const childNodes = getChildNodes(node);
+        if (childNodes) {
+          for (let i = childNodes.length - 1; i >= 0; --i) {
+            arrayPush(stack, childNodes[i]);
+          }
+        }
+      } catch (_) {
+        /* Keep going - one odd node must not stop the rest of the walk */
+      }
+    }
+  };
+
+  /**
    * _sanitizeElements
    *
    * @protect nodeName
    * @protect textContent
    * @protect removeChild
    * @param currentNode to check for permission to exist
+   * @param root the root of the walk currently in progress
    * @return true if node was killed, false if left alive
    */
-  const _sanitizeElements = function (currentNode: any): boolean {
+  const _sanitizeElements = function (currentNode: any, root: Node): boolean {
     let content = null;
 
     /* Execute a hook if present */
     _executeHooks(hooks.beforeSanitizeElements, currentNode, null);
+
+    /* A hook may have detached the node - treat it as removed (see the
+       detached-node comment after the uponSanitizeElement hook below). On
+       the IN_PLACE path, neutralize the detached subtree first so a queued
+       resource handler on it cannot fire in page scope after we return. */
+    if (currentNode !== root && getParentNode(currentNode) === null) {
+      if (IN_PLACE) {
+        _neutralizeSubtree(currentNode);
+      }
+
+      return true;
+    }
 
     /* Check if element is clobbered or can clobber */
     if (_isClobbered(currentNode)) {
@@ -1501,6 +1587,31 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       tagName,
       allowedTags: ALLOWED_TAGS,
     });
+
+    /* A hook may have detached the node from the tree - the documented
+       node.remove() hook pattern. Per the cached getter the node is
+       genuinely out of the tree, so treat it as removed: running the
+       removal checks below on it would make _forceRemove() hit its
+       parentless-node throw, the opposite of a node that is already safely
+       gone. The walk root is exempt: a detached IN_PLACE root is legitimate
+       input and must still be fully sanitized, and a kill-decision on it
+       must keep hitting the REPORT-3 throw. Nodes detached by hooks stay
+       the hook's responsibility for placement and are not recorded in
+       DOMPurify.removed. But the node iterator never visits the descendants
+       of a detached node, and on the IN_PLACE path such a subtree can still
+       hold a queued resource-event handler - e.g. an <img onerror> that
+       began loading when the caller built the live tree - which fires in
+       page scope after sanitize returns even though the handler never
+       reached the returned tree. So on the IN_PLACE path we neutralize the
+       detached subtree inline here, stripping its non-allow-listed
+       attributes before returning. */
+    if (currentNode !== root && getParentNode(currentNode) === null) {
+      if (IN_PLACE) {
+        _neutralizeSubtree(currentNode);
+      }
+
+      return true;
+    }
 
     /* Detect mXSS attempts abusing namespace confusion */
     if (
@@ -1976,7 +2087,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       _executeHooks(hooks.uponSanitizeShadowNode, shadowNode, null);
 
       /* Sanitize tags and elements */
-      _sanitizeElements(shadowNode);
+      _sanitizeElements(shadowNode, fragment);
 
       /* Check attributes next */
       _sanitizeAttributes(shadowNode);
@@ -2265,12 +2376,13 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     }
 
     /* Get node iterator */
-    const nodeIterator = _createNodeIterator(inPlace ? dirty : body);
+    const walkRoot: Node = inPlace ? (dirty as Node) : body;
+    const nodeIterator = _createNodeIterator(walkRoot);
 
     /* Now start iterating over the created document */
     while ((currentNode = nodeIterator.nextNode())) {
       /* Sanitize tags and elements */
-      _sanitizeElements(currentNode);
+      _sanitizeElements(currentNode, walkRoot);
 
       /* Check attributes next */
       _sanitizeAttributes(currentNode);
