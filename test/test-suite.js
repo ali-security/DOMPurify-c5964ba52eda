@@ -5476,5 +5476,108 @@
         );
       }
     );
+
+    QUnit.test(
+      'IN_PLACE: spoofed instance nodeName does not let a <script> pass the tag allowlist',
+      function (assert) {
+        // A live node handed to IN_PLACE can carry an own `nodeName`
+        // property that shadows Node.prototype.nodeName on a non-form
+        // element. The allow/forbid decision must use the real tag name.
+        var host = document.createElement('div');
+        var script = document.createElement('script');
+        script.textContent = 'window.__spoofedNodeNameXSS = 1;';
+        Object.defineProperty(script, 'nodeName', { value: 'DIV' });
+        host.appendChild(script);
+
+        assert.strictEqual(
+          script.nodeName,
+          'DIV',
+          'precondition: instance nodeName is spoofed'
+        );
+
+        window.__spoofedNodeNameXSS = 0;
+        var fixture = document.getElementById('qunit-fixture');
+        try {
+          DOMPurify.sanitize(host, { IN_PLACE: true });
+
+          assert.strictEqual(
+            host.getElementsByTagName('script').length,
+            0,
+            'real <script> with spoofed nodeName is removed'
+          );
+
+          // Inserting the sanitized tree must not execute anything.
+          fixture.appendChild(host);
+          assert.notEqual(
+            window.__spoofedNodeNameXSS,
+            1,
+            'no script ran after inserting the sanitized tree'
+          );
+        } finally {
+          fixture.innerHTML = '';
+          delete window.__spoofedNodeNameXSS;
+        }
+      }
+    );
+
+    QUnit.test(
+      'IN_PLACE: spoofed instance nodeName does not change attribute validation',
+      function (assert) {
+        // A real <a> posing as <img> must not inherit the data: URI
+        // allowance that only DATA_URI_TAGS get.
+        var host = document.createElement('div');
+        var link = document.createElement('a');
+        link.setAttribute(
+          'href',
+          'data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=='
+        );
+        link.textContent = 'click';
+        Object.defineProperty(link, 'nodeName', { value: 'IMG' });
+        host.appendChild(link);
+
+        assert.strictEqual(
+          link.nodeName,
+          'IMG',
+          'precondition: instance nodeName is spoofed'
+        );
+
+        DOMPurify.sanitize(host, { IN_PLACE: true });
+
+        var kept = host.getElementsByTagName('a')[0];
+        assert.ok(kept, 'the real <a> element is kept');
+        assert.notOk(
+          kept.hasAttribute('href'),
+          'data: href is removed from the real <a> element'
+        );
+      }
+    );
+
+    QUnit.test(
+      'Config-Flag tests: TRUSTED_TYPES_POLICY: null skips the internal policy',
+      function (assert) {
+        // Use a fresh instance so no internal policy has been created yet.
+        var purify = DOMPurify(window);
+        var clean = purify.sanitize('<img src=x onerror=alert(1)><b>ok</b>', {
+          TRUSTED_TYPES_POLICY: null,
+          RETURN_TRUSTED_TYPE: true,
+        });
+
+        assert.strictEqual(
+          typeof clean,
+          'string',
+          'no internal Trusted Types policy is created, so a string is returned'
+        );
+        assert.strictEqual(
+          clean,
+          '<img src="x"><b>ok</b>',
+          'output is still sanitized'
+        );
+        assert.strictEqual(
+          String(purify.sanitize('<b onclick="alert(1)">x</b>')),
+          '<b>x</b>',
+          'later default-config calls on the same instance still work'
+        );
+      }
+    );
   };
 });

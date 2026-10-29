@@ -779,7 +779,10 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       emptyHTML = trustedTypesPolicy.createHTML('');
     } else {
       // Uninitialized policy, attempt to initialize the internal dompurify policy.
-      if (trustedTypesPolicy === undefined) {
+      if (
+        trustedTypesPolicy === undefined &&
+        cfg.TRUSTED_TYPES_POLICY !== null
+      ) {
         trustedTypesPolicy = _createTrustedTypesPolicy(
           trustedTypes,
           currentScript
@@ -787,7 +790,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       }
 
       // If creating the internal policy succeeded sign internal variables.
-      if (trustedTypesPolicy !== null && typeof emptyHTML === 'string') {
+      if (trustedTypesPolicy && typeof emptyHTML === 'string') {
         emptyHTML = trustedTypesPolicy.createHTML('');
       }
     }
@@ -1327,7 +1330,9 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     }
 
     /* Now let's check the element's type and name */
-    const tagName = transformCaseFunc(currentNode.nodeName);
+    const tagName = transformCaseFunc(
+      getNodeName ? getNodeName(currentNode) : currentNode.nodeName
+    );
 
     /* Execute a hook if present */
     _executeHooks(hooks.uponSanitizeElement, currentNode, {
@@ -1709,7 +1714,9 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       }
 
       /* Is `value` valid for this attribute? */
-      const lcTag = transformCaseFunc(currentNode.nodeName);
+      const lcTag = transformCaseFunc(
+        getNodeName ? getNodeName(currentNode) : currentNode.nodeName
+      );
       if (!_isValidAttribute(lcTag, lcName, value)) {
         _removeAttribute(name, currentNode);
         continue;
