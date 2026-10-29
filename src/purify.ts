@@ -1134,6 +1134,24 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       currentNode.data = data;
       currentNode = walker.nextNode() as CharacterData | null;
     }
+
+    // The querySelectorAll() lookup below only matches descendants, so when
+    // the root itself is a <template> (e.g. IN_PLACE on a template element)
+    // its own content fragment must be scrubbed explicitly as well.
+    const ownContent = (node as HTMLTemplateElement).content;
+    if (_isDocumentFragment(ownContent)) {
+      _scrubTemplateExpressions(ownContent as unknown as Element);
+    }
+
+    // NodeIterator does not descend into <template>.content per the DOM spec,
+    // so we must explicitly recurse into each template's content fragment,
+    // mirroring the approach used by _sanitizeShadowDOM.
+    const templates = node.querySelectorAll?.('template') ?? [];
+    arrayForEach(Array.from(templates), (tmpl: HTMLTemplateElement) => {
+      if (_isDocumentFragment(tmpl.content)) {
+        _scrubTemplateExpressions(tmpl.content as unknown as Element);
+      }
+    });
   };
 
   /**
