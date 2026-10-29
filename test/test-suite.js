@@ -5579,5 +5579,605 @@
         );
       }
     );
+
+    QUnit.test(
+      'setConfig({IN_PLACE}) is not disabled by an intervening string call (REPORT-2)',
+      (assert) => {
+        DOMPurify.setConfig({ IN_PLACE: true });
+        try {
+          const div1 = document.createElement('div');
+          div1.innerHTML = '<img onerror="alert(1)">'; // no src: avoid a load
+          const ret1 = DOMPurify.sanitize(div1);
+          assert.equal(ret1, div1, 'baseline: returns the same node');
+          assert.notOk(
+            /onerror/i.test(div1.innerHTML),
+            'baseline: node sanitized in place'
+          );
+
+          // An innocuous string call must not flip the persistent IN_PLACE
+          // flag (under setConfig, _parseConfig is skipped on later calls).
+          DOMPurify.sanitize('<b>hello</b>');
+
+          const div2 = document.createElement('div');
+          div2.innerHTML = '<img onerror="alert(1)">';
+          const ret2 = DOMPurify.sanitize(div2);
+          assert.equal(
+            ret2,
+            div2,
+            'after string call: still returns the same node'
+          );
+          assert.notOk(
+            /onerror/i.test(div2.innerHTML),
+            'after string call: node still sanitized in place'
+          );
+        } finally {
+          DOMPurify.clearConfig();
+        }
+      }
+    );
+
+    QUnit.test(
+      'a kill-decision on a detached IN_PLACE root is not a silent no-op (REPORT-3)',
+      (assert) => {
+        // A detached <style> whose text breaks out of the element trips the
+        // mXSS canary. _forceRemove cannot detach a parentless root, so the
+        // node must be neutralized (or the call must throw) rather than be
+        // handed back intact while DOMPurify.removed claims a removal.
+        const style = document.createElement('style');
+        style.textContent = '</style><img onerror=alert(1)>'; // no src
+        let ret = null;
+        try {
+          ret = DOMPurify.sanitize(style, { IN_PLACE: true });
+        } catch (_) {
+          assert.ok(true, 'fail-closed by throwing is acceptable');
+          return;
+        }
+
+        // Emulate the app-side store-and-rerender (serialize -> reparse).
+        const probe = document.createElement('div');
+        probe.innerHTML = (ret || style).outerHTML;
+        assert.notOk(
+          probe.querySelector('[onerror],[onload],script'),
+          'no executable sink survives serialize/reparse: ' + probe.innerHTML
+        );
+
+        const claimedRemoval = DOMPurify.removed.some(
+          (entry) => entry.element === style
+        );
+        const stillDangerous = /<\/style|onerror/i.test(
+          style.textContent || ''
+        );
+        assert.notOk(
+          claimedRemoval && stillDangerous,
+          'DOMPurify.removed bookkeeping matches reality'
+        );
+      }
+    );
+
+    QUnit.test(
+      'a style root holding an element child is not returned intact by IN_PLACE (REPORT-3)',
+      (assert) => {
+        // The "style with an element child" mXSS rule decides to kill the
+        // root. A parentless root cannot be detached, so DOMPurify must
+        // refuse (throw) instead of handing the caller the payload back.
+        const style = document.createElement('style');
+        const img = document.createElement('img');
+        img.setAttribute('onerror', 'alert(1)'); // no src: avoid a load
+        style.appendChild(img);
+
+        assert.throws(
+          () => DOMPurify.sanitize(style, { IN_PLACE: true }),
+          /could not be detached/,
+          'killed parentless IN_PLACE root fails closed'
+        );
+      }
+    );
+
+    // =======================================================================
+    // Security regression — GHSA-vxr8-fq34-vvx9 (CVE-2026-65899):
+    // a caller-supplied TRUSTED_TYPES_POLICY must not outlive its config,
+    // and no policy callback may re-enter sanitize().
+    // =======================================================================
+    // Every test builds a fresh instance over a window-like object that
+    // exposes this page's DOM constructors but a fake `trustedTypes`
+    // factory, so policy creation is observable and deterministic in every
+    // engine (Trusted Types support and duplicate-name rules vary).
+    QUnit.module('Security — Trusted Types policy lifetime (GHSA-vxr8-fq34-vvx9)');
+
+    class FakeTrustedValue {
+      constructor(s) {
+        this.s = s;
+      }
+
+      toString() {
+        return this.s;
+      }
+    }
+
+    const makeTrustedTypesWindow = (created, extra) => {
+      const trustedTypes = Object.assign(
+        {
+          createPolicy(name, rules) {
+            created.push(name);
+            return {
+              createHTML(s) {
+                return new FakeTrustedValue(rules.createHTML(s));
+              },
+              createScriptURL(s) {
+                return new FakeTrustedValue(rules.createScriptURL(s));
+              },
+            };
+          },
+        },
+        extra || {}
+      );
+
+      return {
+        document: window.document,
+        DocumentFragment: window.DocumentFragment,
+        HTMLTemplateElement: window.HTMLTemplateElement,
+        Node: window.Node,
+        Element: window.Element,
+        NodeFilter: window.NodeFilter,
+        NamedNodeMap: window.NamedNodeMap,
+        HTMLFormElement: window.HTMLFormElement,
+        DOMParser: window.DOMParser,
+        trustedTypes,
+      };
+    };
+
+    // A caller-supplied policy that ignores its input and always emits a
+    // fixed payload — stands in for an unsafe/foreign policy installed by a
+    // less-trusted integration.
+    const unsafeCallerPolicy = () => ({
+      createHTML() {
+        return new FakeTrustedValue('<img src=x onerror=alert(1)>');
+      },
+      createScriptURL(url) {
+        return url;
+      },
+    });
+
+    QUnit.test(
+      'GHSA-vxr8-fq34-vvx9: a per-call TRUSTED_TYPES_POLICY does not survive clearConfig()',
+      (assert) => {
+        const created = [];
+        const purify = DOMPurify(makeTrustedTypesWindow(created));
+
+        const during = String(
+          purify.sanitize('<b>x</b>', {
+            TRUSTED_TYPES_POLICY: unsafeCallerPolicy(),
+            RETURN_TRUSTED_TYPE: true,
+          })
+        );
+        assert.ok(
+          /onerror/.test(during),
+          'precondition: opted-in policy applies to its own call'
+        );
+
+        purify.clearConfig();
+
+        const after = purify.sanitize('<img src=x onerror=alert(1)>', {
+          RETURN_TRUSTED_TYPE: true,
+        });
+        assert.equal(
+          String(after),
+          '<img src="x">',
+          'stale caller policy must not sign output after clearConfig()'
+        );
+        assert.ok(
+          after instanceof FakeTrustedValue,
+          'output is signed by the internal default policy'
+        );
+        assert.deepEqual(
+          created,
+          ['dompurify'],
+          'internal default policy is restored after clearConfig()'
+        );
+      }
+    );
+
+    QUnit.test(
+      'GHSA-vxr8-fq34-vvx9: a setConfig() TRUSTED_TYPES_POLICY does not survive clearConfig()',
+      (assert) => {
+        const created = [];
+        const purify = DOMPurify(makeTrustedTypesWindow(created));
+
+        purify.setConfig({
+          TRUSTED_TYPES_POLICY: unsafeCallerPolicy(),
+          RETURN_TRUSTED_TYPE: true,
+        });
+        assert.ok(
+          /onerror/.test(String(purify.sanitize('<b>x</b>'))),
+          'precondition: configured policy signs output while configured'
+        );
+
+        purify.clearConfig();
+
+        const after = String(
+          purify.sanitize('<img src=x onerror=alert(1)>', {
+            RETURN_TRUSTED_TYPE: true,
+          })
+        );
+        assert.equal(
+          after,
+          '<img src="x">',
+          'torn-down policy must not sign later output'
+        );
+
+        // Also covers the early-return path (input without any markup).
+        purify.clearConfig();
+        assert.equal(
+          String(purify.sanitize('plain', { RETURN_TRUSTED_TYPE: true })),
+          'plain',
+          'markup-free input is not signed by the torn-down policy'
+        );
+      }
+    );
+
+    QUnit.test(
+      'GHSA-vxr8-fq34-vvx9: TRUSTED_TYPES_POLICY: null drops a previously active policy',
+      (assert) => {
+        const created = [];
+        const purify = DOMPurify(makeTrustedTypesWindow(created));
+
+        purify.sanitize('<b>x</b>', {
+          TRUSTED_TYPES_POLICY: unsafeCallerPolicy(),
+          RETURN_TRUSTED_TYPE: true,
+        });
+
+        const afterNull = purify.sanitize('<img src=x onerror=alert(1)>', {
+          TRUSTED_TYPES_POLICY: null,
+          RETURN_TRUSTED_TYPE: true,
+        });
+        assert.strictEqual(
+          typeof afterNull,
+          'string',
+          'null opts out of any retained policy'
+        );
+        assert.equal(afterNull, '<img src="x">', 'null returns the sanitized string');
+
+        // The retained caller policy must not resurface on the next call
+        // either; the internal default policy takes over instead.
+        const next = purify.sanitize('<img src=x onerror=alert(1)>', {
+          RETURN_TRUSTED_TYPE: true,
+        });
+        assert.equal(
+          String(next),
+          '<img src="x">',
+          'caller policy does not come back after the null opt-out'
+        );
+        assert.ok(
+          next instanceof FakeTrustedValue,
+          'next config-less call is signed by the internal default policy'
+        );
+      }
+    );
+
+    QUnit.test(
+      'GHSA-vxr8-fq34-vvx9: the internal policy is created at most once',
+      (assert) => {
+        const created = [];
+        const purify = DOMPurify(makeTrustedTypesWindow(created));
+
+        const out = purify.sanitize('<b>ok</b><script>alert(2)</script>', {
+          RETURN_TRUSTED_TYPE: true,
+        });
+        assert.ok(
+          out instanceof FakeTrustedValue,
+          'returns a Trusted Type, not a plain string'
+        );
+        assert.equal(String(out), '<b>ok</b>', 'script removed');
+
+        // Trusted Types throws on duplicate policy names, so neither
+        // clearConfig() nor a null opt-out may recreate the policy.
+        purify.clearConfig();
+        purify.sanitize('<b>again</b>', { RETURN_TRUSTED_TYPE: true });
+        purify.sanitize('<b>x</b>', { TRUSTED_TYPES_POLICY: null });
+        purify.sanitize('<b>y</b>', { RETURN_TRUSTED_TYPE: true });
+        purify.clearConfig();
+        purify.sanitize('<b>z</b>');
+        assert.deepEqual(
+          created,
+          ['dompurify'],
+          'internal dompurify policy created exactly once'
+        );
+      }
+    );
+
+    QUnit.test(
+      'GHSA-vxr8-fq34-vvx9: a self-referential createScriptURL throws instead of recursing',
+      (assert) => {
+        const purify = DOMPurify(
+          makeTrustedTypesWindow([], {
+            // Needed for DOMPurify to reach the TrustedScriptURL branch.
+            getAttributeType(tag, attr) {
+              return tag === 'script' && attr === 'src'
+                ? 'TrustedScriptURL'
+                : null;
+            },
+          })
+        );
+        const cfg = { ADD_TAGS: ['script'], ADD_ATTR: ['src'] };
+
+        // CreateScriptURL re-entering sanitize is circular in the same way
+        // as the createHTML case (#1422); it must fail fast rather than
+        // recurse into a stack overflow. (A lone top-level <script> is
+        // dropped by the parser, so it is wrapped in a <div>.)
+        const selfPolicy = {
+          createHTML(input) {
+            return input;
+          },
+          createScriptURL() {
+            return purify.sanitize(
+              '<div><script src=x></script></div>',
+              Object.assign({ TRUSTED_TYPES_POLICY: selfPolicy }, cfg)
+            );
+          },
+        };
+
+        assert.throws(
+          () => {
+            purify.sanitize(
+              '<div><script src=x></script></div>',
+              Object.assign({ TRUSTED_TYPES_POLICY: selfPolicy }, cfg)
+            );
+          },
+          /must not call DOMPurify\.sanitize/,
+          'circular createScriptURL throws a descriptive TypeError'
+        );
+
+        // The failed call must not poison the instance.
+        assert.equal(
+          purify.sanitize('<img src=x onerror=alert(1)>'),
+          '<img src="x">'
+        );
+      }
+    );
+
+    QUnit.test(
+      'GHSA-vxr8-fq34-vvx9: a self-referential createHTML throws instead of recursing',
+      (assert) => {
+        const purify = DOMPurify(makeTrustedTypesWindow([]));
+        const selfPolicy = {
+          createHTML(input) {
+            return purify.sanitize(input);
+          },
+          createScriptURL(input) {
+            return input;
+          },
+        };
+
+        assert.throws(
+          () => {
+            purify.setConfig({ TRUSTED_TYPES_POLICY: selfPolicy });
+          },
+          /must not call DOMPurify\.sanitize/,
+          'circular createHTML throws a descriptive TypeError'
+        );
+
+        // The failed setConfig must not poison the instance.
+        assert.equal(
+          String(purify.sanitize('<img src=x onerror=alert(1)>')),
+          '<img src="x">'
+        );
+      }
+    );
+
+    // =======================================================================
+    // DOM clobbering — comprehensive matrix ("roundhouse")
+    //
+    // A tripwire over the full cross-product of clobber-carrier markup and the
+    // property/method names DOMPurify relies on when reading DOM nodes. The
+    // carrier is <form>: its named/id children shadow built-ins via
+    // LegacyOverrideBuiltIns, which is the element-level clobbering vector the
+    // sanitizer must survive.
+    //
+    // IMPORTANT: this override is a *real-browser* behavior. jsdom does NOT
+    // implement it, so under jsdom these tests pass trivially (no clobber ever
+    // happens) — they only grow teeth in the Chromium (Playwright) run. The
+    // first assertion reports whether the override is live in the current
+    // engine so a green jsdom run is not mistaken for real coverage.
+    // =======================================================================
+
+    QUnit.module('DOM clobbering — comprehensive matrix');
+
+    // Names DOMPurify (or a downstream consumer) reads off a node. Shadowing
+    // any of these is the lever an attacker would pull.
+    const CLOBBER_NAMES = [
+      // identity / type
+      'nodeName',
+      'nodeType',
+      'nodeValue',
+      'tagName',
+      'localName',
+      'namespaceURI',
+      'prefix',
+      // content
+      'textContent',
+      'innerHTML',
+      'outerHTML',
+      'innerText',
+      'data',
+      // tree navigation
+      'parentNode',
+      'parentElement',
+      'childNodes',
+      'children',
+      'firstChild',
+      'lastChild',
+      'firstElementChild',
+      'lastElementChild',
+      'nextSibling',
+      'previousSibling',
+      'nextElementSibling',
+      'previousElementSibling',
+      'ownerDocument',
+      'getRootNode',
+      'content',
+      // attributes
+      'attributes',
+      'getAttribute',
+      'getAttributeNode',
+      'getAttributeNames',
+      'hasAttribute',
+      'hasAttributes',
+      'setAttribute',
+      'setAttributeNS',
+      'removeAttribute',
+      'removeAttributeNS',
+      // mutation
+      'removeChild',
+      'appendChild',
+      'insertBefore',
+      'replaceChild',
+      'cloneNode',
+      'remove',
+      'replaceWith',
+      'before',
+      'after',
+      // shadow / query
+      'shadowRoot',
+      'host',
+      'attachShadow',
+      'querySelector',
+      'querySelectorAll',
+      'getElementsByTagName',
+      'matches',
+      'closest',
+      // misc props read during sanitization or by consumers
+      'classList',
+      'className',
+      'id',
+      'name',
+      'is',
+      'value',
+      'type',
+      'style',
+    ];
+
+    // Inert sinks: none auto-loads (no <img src>), none executes in a parsed
+    // or disconnected document, so the harness can never fire them itself —
+    // yet each leaves a syntactic trace if sanitization is defeated.
+    const CLOBBER_SINKS =
+      '<img onerror="window.__clob=(window.__clob||0)+1">' +
+      '<a href="javascript:window.__clob=1">x</a>' +
+      '<script>window.__clob=1</script>' +
+      '<div onclick="window.__clob=1">z</div>';
+
+    const clobberHasSink = (s) => /\son\w+\s*=|<script|javascript:/i.test(s);
+    const clobberReparseSink = (s) =>
+      new window.DOMParser()
+        .parseFromString(s, 'text/html')
+        .querySelector('[onerror],[onload],[onclick],script');
+
+    const clobberPayloads = (name) => [
+      '<form><input name="' + name + '">' + CLOBBER_SINKS + '</form>',
+      '<form><input id="' + name + '">' + CLOBBER_SINKS + '</form>',
+      // two same-named controls -> a RadioNodeList/HTMLCollection clobber
+      '<form><input name="' +
+        name +
+        '"><input name="' +
+        name +
+        '">' +
+        CLOBBER_SINKS +
+        '</form>',
+      '<form name="' + name + '">' + CLOBBER_SINKS + '</form>',
+    ];
+
+    QUnit.test(
+      'no clobbering combination defeats sanitization (string path)',
+      (assert) => {
+        window.__clob = 0;
+
+        // Report whether this engine overrides built-ins at all.
+        const probe = document.createElement('form');
+        probe.innerHTML =
+          '<input name="attributes"><input name="getAttributeNames">';
+        const realAttributes = Object.getOwnPropertyDescriptor(
+          window.Element.prototype,
+          'attributes'
+        ).get.call(probe);
+        const overrideLive =
+          typeof probe.nodeName !== 'string' ||
+          typeof probe.getAttributeNames !== 'function' ||
+          probe.attributes !== realAttributes;
+        assert.ok(
+          true,
+          'form LegacyOverrideBuiltIns active in this engine: ' + overrideLive
+        );
+
+        const failures = [];
+        const allBlocks = [];
+        for (const name of CLOBBER_NAMES) {
+          for (const payload of clobberPayloads(name)) {
+            allBlocks.push(payload);
+            const out = DOMPurify.sanitize(payload);
+            if (clobberHasSink(out) || clobberReparseSink(out)) {
+              failures.push(name + ' :: ' + out.slice(0, 160));
+            }
+          }
+        }
+        assert.deepEqual(
+          failures,
+          [],
+          'every individual clobber payload sanitized to a sink-free result'
+        );
+
+        // The roundhouse: the entire matrix in a single block.
+        const big = DOMPurify.sanitize(allBlocks.join(''));
+        assert.notOk(
+          clobberHasSink(big) || clobberReparseSink(big),
+          'combined clobbering block leaves no executable sink'
+        );
+
+        assert.equal(
+          window.__clob,
+          0,
+          'no clobbering payload executed during the test'
+        );
+      }
+    );
+
+    QUnit.test(
+      'clobbered IN_PLACE roots throw or sanitize safely',
+      (assert) => {
+        window.__clob = 0;
+        // Disconnected roots, inert sinks: nothing loads or fires here.
+        const inPlaceSinks =
+          '<img onerror="window.__clob=1">' +
+          '<a href="javascript:window.__clob=1">x</a>' +
+          '<div onclick="window.__clob=1">z</div>';
+
+        const failures = [];
+        for (const name of CLOBBER_NAMES) {
+          const root = document.createElement('form');
+          root.innerHTML = '<input name="' + name + '">' + inPlaceSinks;
+
+          let threw = false;
+          let out = null;
+          try {
+            out = DOMPurify.sanitize(root, { IN_PLACE: true });
+          } catch (_) {
+            threw = true; // fail-closed is acceptable (clobbered/forbidden root)
+          }
+
+          // Either it threw, or the returned node carries no sink.
+          if (!threw && clobberHasSink(out.outerHTML)) {
+            failures.push(name + ' :: ' + out.outerHTML.slice(0, 160));
+          }
+        }
+        assert.deepEqual(
+          failures,
+          [],
+          'every clobbered IN_PLACE root threw or returned a sink-free node'
+        );
+        assert.equal(
+          window.__clob,
+          0,
+          'no payload executed during IN_PLACE matrix'
+        );
+      }
+    );
   };
 });
